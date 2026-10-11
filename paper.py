@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import platform
 import importlib
 import importlib.util
 import site
@@ -46,13 +47,105 @@ _NON_CHAT_HINTS = ("whisper", "tts", "guard", "orpheus", "playai", "embed")
 _PLACEHOLDER_HINTS = ("your", "here", "xxxx", "changeme", "paste", "insert", "example", "<")
 
 
-def _should_open_browser():
-    if SETUP_HANDLES_BROWSER or os.environ.get("PAPER_NO_BROWSER"):
+# ---- opening the page in your browser ------------------------------
+# Tries every launcher the OS offers (open / startfile / xdg-open / WSL / Termux / $BROWSER)
+# and checks that one actually accepted the link, instead of hoping webbrowser.open() worked.
+# PAPER_NO_BROWSER=1 turns it off.
+def _launch(cmd, env=None):
+    """Run a launcher command. True if it started (or is still running, like a browser that blocks)."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=env, start_new_session=(os.name != "nt"))
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    if sys.platform.startswith("linux") and not (
-            os.environ.get("BROWSER") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return False    # headless Linux: webbrowser could launch a text browser in this terminal
-    return True
+    try:
+        return p.wait(timeout=3) == 0
+    except subprocess.TimeoutExpired:
+        return True
+
+
+def _is_wsl():
+    try:
+        return "microsoft" in platform.uname().release.lower()
+    except Exception:
+        return False
+
+
+def _linux_gui_env():
+    """Environment that can reach a desktop. None if this really is a headless machine.
+    Started over SSH or from a service? Borrow the local desktop session if one is running."""
+    env = dict(os.environ)
+    if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
+        return env
+    try:
+        runtime = env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    except AttributeError:
+        return None
+    if os.path.exists("/tmp/.X11-unix/X0"):
+        env["DISPLAY"] = ":0"
+        xauth = os.path.expanduser("~/.Xauthority")
+        if not env.get("XAUTHORITY") and os.path.exists(xauth):
+            env["XAUTHORITY"] = xauth
+        return env
+    for name in ("wayland-0", "wayland-1"):
+        if os.path.exists(os.path.join(runtime, name)):
+            env["WAYLAND_DISPLAY"] = name
+            env["XDG_RUNTIME_DIR"] = runtime
+            return env
+    return None
+
+
+def _open_browser(url):
+    """Open url in the default browser. True once a launcher accepted it, False if nothing worked."""
+    if os.environ.get("PAPER_NO_BROWSER"):
+        return True                                   # switched off on purpose, not a failure
+    text_browser_risk = False
+    if sys.platform == "darwin":
+        if _launch(["open", url]):
+            return True
+    elif os.name == "nt":
+        try:
+            os.startfile(url)
+            return True
+        except (OSError, AttributeError):
+            pass
+        if _launch(["cmd", "/c", "start", "", url]):
+            return True
+    else:
+        if _is_wsl():
+            for cmd in (["wslview", url], ["cmd.exe", "/c", "start", "", url], ["explorer.exe", url]):
+                if shutil.which(cmd[0]) and _launch(cmd):
+                    return True
+        if shutil.which("termux-open-url") and _launch(["termux-open-url", url]):
+            return True
+        env = _linux_gui_env()
+        if env is None:
+            text_browser_risk = True                  # headless: webbrowser could start lynx/w3m in this terminal
+        else:
+            for cmd in (["xdg-open", url], ["gio", "open", url],
+                        ["sensible-browser", url], ["x-www-browser", url]):
+                if shutil.which(cmd[0]) and _launch(cmd, env):
+                    return True
+    if not text_browser_risk or os.environ.get("BROWSER"):
+        try:
+            if webbrowser.open(url, new=2):           # also honours $BROWSER
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _open_browser_soon(url):
+    """Open the page a moment after the server starts. If nothing can, say so and show the link."""
+    if SETUP_HANDLES_BROWSER:
+        return                                        # the setup page is open and redirects itself
+
+    def run():
+        if not _open_browser(url):
+            print("   Could not open a browser on its own. Open this link yourself:  " + url)
+    t = threading.Timer(0.5, run)
+    t.daemon = True
+    t.start()
 
 
 # ---- step 1: Python tools -----------------------------------------
@@ -526,6 +619,7 @@ def _run_setup_wizard(reason):
     host = os.environ.get("PAPER_HOST") or ("0.0.0.0" if in_codespaces else "127.0.0.1")
     loopback = host in ("127.0.0.1", "localhost", "::1")
     state = {"envExists": os.path.isfile(_ENV_PATH), "envPath": _ENV_PATH, "defaultModel": _DEFAULT_MODEL}
+    served = {"page": False}          # did a browser ever load the setup page?
     page = (_SETUP_PAGE
             .replace("__SETUP_TOKEN__", token)
             .replace("__SETUP_STATE__", json.dumps(state).replace("<", "\\u003c")))
@@ -580,6 +674,7 @@ def _run_setup_wizard(reason):
                 return self._json(403, {"error": "Forbidden host"})
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
+                served["page"] = True
                 return self._send(200, page, "text/html; charset=utf-8")
             if path == "/api/ping":
                 return self._json(200, {"app": "setup"})
@@ -664,8 +759,7 @@ def _run_setup_wizard(reason):
     print("=" * 55)
 
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True).start()
-    if _should_open_browser():
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    _open_browser_soon(url)
 
     try:
         while not done.wait(0.5):
@@ -681,7 +775,7 @@ def _run_setup_wizard(reason):
     srv.server_close()
     # Paper will now start on this same port; the setup page redirects there by itself.
     os.environ["PAPER_PORT"] = str(port)
-    SETUP_HANDLES_BROWSER = True
+    SETUP_HANDLES_BROWSER = served["page"]   # only skip opening Paper if the setup tab exists to redirect itself
 
 
 def ensure_environment():
@@ -2883,8 +2977,7 @@ def serve():
     print("   Ctrl+C or the ⏻ button in the page powers down.")
     print("=" * 55)
 
-    if _should_open_browser():
-        threading.Timer(0.8, lambda: webbrowser.open(local_url)).start()
+    _open_browser_soon(local_url)
 
     try:
         server.serve_forever(poll_interval=0.25)
