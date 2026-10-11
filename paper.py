@@ -10,11 +10,12 @@ import threading
 import time
 import uuid
 import webbrowser
+import importlib
+import importlib.util
+import site
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-from dotenv import load_dotenv
-from groq import Groq
 
 # Emoji-safe console output on every OS (Windows terminals default to a legacy encoding)
 try:
@@ -22,12 +23,693 @@ try:
 except Exception:
     pass
 
+
+# ------------------------------------------------------------------
+# First-run setup
+# Runs BEFORE python-dotenv / groq are imported, so a fresh machine works:
+#   1. missing Python tools (python-dotenv, groq) are installed automatically
+#   2. if there is no .env (or it has no Groq key) a small setup page opens in
+#      the browser, checks the key with Groq, and writes the .env for you
+# Run `python paper.py --setup` any time to repeat step 2 (e.g. to change the key).
+# Set PAPER_NO_AUTOINSTALL=1 to stop it from installing anything itself.
+# ------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_HERE, ".env")
+_REQUIRED_PACKAGES = {"dotenv": "python-dotenv", "groq": "groq"}   # import name -> pip name
+_DEFAULT_MODEL = "openai/gpt-oss-20b"
+_FORCE_SETUP = "--setup" in sys.argv[1:]
+SETUP_HANDLES_BROWSER = False    # True once the setup page is open and will redirect itself
+
+_KEY_RE = re.compile(r"^[A-Za-z0-9_\-]{16,200}$")
+_MODEL_RE = re.compile(r"^[A-Za-z0-9_\-./:]{1,100}$")
+_NON_CHAT_HINTS = ("whisper", "tts", "guard", "orpheus", "playai", "embed")
+_PLACEHOLDER_HINTS = ("your", "here", "xxxx", "changeme", "paste", "insert", "example", "<")
+
+
+def _should_open_browser():
+    if SETUP_HANDLES_BROWSER or os.environ.get("PAPER_NO_BROWSER"):
+        return False
+    if sys.platform.startswith("linux") and not (
+            os.environ.get("BROWSER") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False    # headless Linux: webbrowser could launch a text browser in this terminal
+    return True
+
+
+# ---- step 1: Python tools -----------------------------------------
+def _missing_packages():
+    return [pip for mod, pip in _REQUIRED_PACKAGES.items() if importlib.util.find_spec(mod) is None]
+
+
+def _venv_python(venv_dir):
+    if os.name == "nt":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python")
+
+
+def _pip_install(python, packages):
+    """Returns (ok, output). Bootstraps pip itself first if the interpreter has none."""
+    cmd = [python, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", *packages]
+    out = ""
+    for attempt in (1, 2):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, str(e)
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode == 0:
+            return True, out
+        if attempt == 1 and "No module named pip" in out:
+            print("   pip is missing, setting it up first...")
+            subprocess.run([python, "-m", "ensurepip", "--upgrade"], capture_output=True)
+            continue
+        break
+    return False, out
+
+
+def _pip_error_summary(out):
+    """Short, readable reason for a failed pip run (pip prints a lot of retry noise)."""
+    lines = [l for l in (out or "").strip().splitlines() if l.strip()]
+    pick = [l for l in lines if l.startswith("ERROR")] or lines
+    text = "\n".join(pick[-6:])
+    if any(w in (out or "") for w in ("NewConnectionError", "Name or service not known",
+                                      "Temporary failure in name resolution", "getaddrinfo failed")):
+        text += "\n   It looks like there is no internet connection."
+    return text
+
+
+def _make_importable():
+    """Let this already-running process see packages that were just installed."""
+    importlib.invalidate_caches()
+    try:
+        user_site = site.getusersitepackages()
+        if os.path.isdir(user_site) and user_site not in sys.path:
+            site.addsitedir(user_site)
+    except Exception:
+        pass
+
+
+def _relaunch_in_venv(packages):
+    """
+    For Pythons that refuse global installs (Debian/Ubuntu/Homebrew): build a private
+    .venv beside paper.py, install there, and run Paper again inside it. Never returns.
+    """
+    venv_dir = os.path.join(_HERE, ".venv")
+    py = _venv_python(venv_dir)
+    if not os.path.isfile(py):
+        print(f"   Creating a private environment in {venv_dir} ...")
+        r = subprocess.run([sys.executable, "-m", "venv", venv_dir],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            raise SystemExit("❌ Couldn't create a virtual environment:\n"
+                             + (r.stderr or r.stdout or "").strip()[-600:]
+                             + "\n   On Debian/Ubuntu try: sudo apt install python3-venv")
+    print("   Installing into it ...")
+    ok, out = _pip_install(py, packages)
+    if not ok:
+        raise SystemExit("❌ Install into the private environment failed:\n" + _pip_error_summary(out))
+    print("   Restarting Paper inside the new environment...\n")
+    try:
+        code = subprocess.call([py, os.path.abspath(__file__), *sys.argv[1:]],
+                               env=dict(os.environ, PAPER_IN_VENV="1"))
+    except KeyboardInterrupt:
+        code = 130
+    raise SystemExit(code)
+
+
+def _ensure_packages():
+    missing = _missing_packages()
+    if not missing:
+        return
+    print("=" * 55)
+    print("🔧 First-run setup: missing Python tools -> " + ", ".join(missing))
+    manual = f"{sys.executable} -m pip install {' '.join(missing)}"
+    if os.environ.get("PAPER_NO_AUTOINSTALL"):
+        raise SystemExit(f"❌ PAPER_NO_AUTOINSTALL is set. Install them yourself:\n   {manual}")
+    if os.environ.get("PAPER_IN_VENV"):
+        raise SystemExit(f"❌ Still missing inside the private environment. Try:\n   {manual}")
+
+    print(f"   Installing with pip ({sys.executable}) ...")
+    ok, out = _pip_install(sys.executable, missing)
+    if not ok and "externally-managed-environment" in out:
+        print("   This Python is managed by your OS, so Paper will use its own private environment instead.")
+        _relaunch_in_venv(missing)      # does not return
+    if not ok:
+        raise SystemExit(f"❌ Couldn't install {', '.join(missing)}:\n{_pip_error_summary(out)}\n\n"
+                         f"   Check your internet connection, or install them yourself:\n   {manual}")
+    _make_importable()
+    still = _missing_packages()
+    if still:
+        raise SystemExit(f"❌ Installed, but Python still can't find: {', '.join(still)}.\n"
+                         f"   Run Paper again; if it keeps happening try:\n   {manual}")
+    print("   ✅ Installed: " + ", ".join(missing))
+
+
+# ---- step 2: .env + Groq key --------------------------------------
+def _key_is_missing(value):
+    v = (value or "").strip().strip("\"'")
+    if not v:
+        return True
+    # Real Groq keys start with gsk_, so those are never mistaken for a placeholder
+    return (not v.startswith("gsk_")) and any(h in v.lower() for h in _PLACEHOLDER_HINTS)
+
+
+def _clean_key(raw):
+    """Accepts a bare key or a pasted 'GROQ_API_KEY=...' line, with or without quotes."""
+    k = raw.strip() if isinstance(raw, str) else ""
+    k = re.sub(r"^(?:export\s+)?GROQ_API_KEY\s*=\s*", "", k)
+    return k.strip().strip("\"'").strip()
+
+
+def _write_env(updates):
+    """Create or update .env beside paper.py. Other lines are kept; only the given keys change."""
+    lines = []
+    if os.path.isfile(_ENV_PATH):
+        with open(_ENV_PATH, "r", encoding="utf-8-sig") as f:    # utf-8-sig: tolerate a Windows BOM
+            lines = f.read().splitlines()
+    seen, out = set(), []
+    for line in lines:
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if m and m.group(1) in updates:
+            out.append(f"{m.group(1)}={updates[m.group(1)]}")
+            seen.add(m.group(1))
+        else:
+            out.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out.append(f"{k}={v}")
+    tmp = _ENV_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)    # key file: owner-only
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, _ENV_PATH)
+
+
+def _protect_env_in_git():
+    """If paper.py lives in a git repo, make sure .env can't be committed by accident."""
+    d, in_repo = _HERE, False
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            in_repo = True
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    if not in_repo:
+        return
+    gi = os.path.join(_HERE, ".gitignore")
+    try:
+        existing = ""
+        if os.path.isfile(gi):
+            with open(gi, "r", encoding="utf-8") as f:
+                existing = f.read()
+        if any(l.strip() in (".env", "/.env", "*.env", ".env*") for l in existing.splitlines()):
+            return
+        with open(gi, "a", encoding="utf-8", newline="\n") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(".env\n")
+        print("   🛡️  Added .env to .gitignore so your key can't be committed by accident.")
+    except OSError:
+        pass
+
+
+def _check_groq_key(key):
+    """Ask Groq for the model list. Returns (chat_model_ids, error_message, can_skip)."""
+    from groq import Groq
+    try:
+        resp = Groq(api_key=key, timeout=15.0, max_retries=0).models.list()
+    except Exception as e:
+        status = getattr(e, "status_code", None)
+        if status == 401:
+            return None, ("Groq rejected that key. Make sure you copied all of it "
+                          "(it starts with gsk_) and that it hasn't been deleted."), False
+        what = f"HTTP {status}" if status else type(e).__name__
+        return None, f"Couldn't verify the key with Groq ({what}). Check your internet connection and try again.", True
+    ids = sorted({m.id for m in resp.data if not any(h in m.id.lower() for h in _NON_CHAT_HINTS)})
+    if _DEFAULT_MODEL in ids:
+        ids.remove(_DEFAULT_MODEL)
+        ids.insert(0, _DEFAULT_MODEL)
+    return (ids or [_DEFAULT_MODEL]), None, False
+
+
+_SETUP_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="setup-token" content="__SETUP_TOKEN__">
+<title>Silicon Paper</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<style>
+:root { --ink: #0e0e0e; --mute: #8c8c88; --faint: #cfcfcb; --hair: #e8e8e5; --ok: #3d6b4f; --err: #a4483f; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { height: 100%; }
+body { min-height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Helvetica, Arial, sans-serif;
+  color: var(--ink);
+  background: radial-gradient(1300px 720px at 50% -22%, rgba(244, 244, 240, 0.95) 0%, rgba(247, 247, 244, 0.55) 38%, rgba(255, 255, 255, 0) 100%) no-repeat #fff;
+  -webkit-font-smoothing: antialiased;
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px 28px;
+}
+main { width: 100%; max-width: 460px; }
+
+.brand { font-size: 11px; font-weight: 500; letter-spacing: 0.34em; text-transform: uppercase; color: var(--mute); margin-bottom: 48px; }
+h1 {
+  font-family: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+  font-weight: 400; font-size: clamp(42px, 9vw, 60px); letter-spacing: -0.025em; line-height: 1.02;
+}
+.lede { color: var(--mute); font-size: 16px; line-height: 1.5; margin: 14px 0 38px; }
+
+.field { position: relative; display: flex; align-items: center; gap: 14px; padding-bottom: 16px; border-bottom: 1px solid var(--hair); }
+.field .line { position: absolute; left: 0; bottom: -1px; height: 1px; width: 100%; background: var(--ink); transform: scaleX(0); transform-origin: left; transition: transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1); }
+.field:focus-within .line { transform: scaleX(1); }
+
+input, select { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font: inherit; color: var(--ink); padding: 0; }
+input { font-size: 22px; letter-spacing: 0.02em; }
+input::placeholder { color: var(--faint); letter-spacing: 0.04em; }
+select {
+  font-size: 18px; cursor: pointer; -webkit-appearance: none; appearance: none; padding-right: 26px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%238c8c88' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E") no-repeat right 4px center;
+}
+
+button { font: inherit; cursor: pointer; border: 0; background: none; color: inherit; }
+.link { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mute); transition: color 0.25s; white-space: nowrap; }
+.link:hover { color: var(--ink); }
+
+.go { flex-shrink: 0; width: 46px; height: 46px; border-radius: 50%; background: var(--ink); color: #fff; display: grid; place-items: center; transition: transform 0.3s cubic-bezier(0.2, 0.7, 0.2, 1), background 0.3s, opacity 0.3s; }
+.go:hover:not(:disabled) { transform: translateX(3px); }
+.go:disabled { background: var(--hair); cursor: default; }
+.go.busy svg { display: none; }
+.go.busy::after { content: ''; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid rgba(255, 255, 255, 0.35); border-top-color: #fff; animation: spin 0.8s linear infinite; }
+
+.pill { margin-top: 36px; background: var(--ink); color: #fff; font-size: 13px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; padding: 16px 34px; border-radius: 999px; transition: transform 0.3s cubic-bezier(0.2, 0.7, 0.2, 1), opacity 0.3s; }
+.pill:hover:not(:disabled) { transform: translateY(-1px); }
+.pill:disabled { opacity: 0.45; cursor: default; }
+
+.aside { margin-top: 22px; font-size: 13px; color: var(--mute); }
+a { color: var(--ink); text-decoration: none; background: linear-gradient(var(--ink), var(--ink)) 0 100% / 100% 1px no-repeat; padding-bottom: 1px; transition: background-size 0.4s; }
+a:hover { background-size: 0 1px; }
+
+#step2 { margin-top: 44px; }
+.label { font-size: 11px; font-weight: 500; letter-spacing: 0.3em; text-transform: uppercase; color: var(--mute); margin-bottom: 18px; }
+
+.msg { min-height: 20px; margin-top: 22px; font-size: 13px; letter-spacing: 0.01em; line-height: 1.5; color: var(--mute); }
+.msg.err { color: var(--err); }
+.msg.ok { color: var(--ok); }
+#skip { margin-top: 8px; }
+.foot { margin-top: 56px; font-size: 12px; line-height: 1.6; color: #b4b4af; }
+
+.bar { height: 1px; width: 100%; margin-top: 36px; background: var(--hair); overflow: hidden; position: relative; }
+.bar::after { content: ''; position: absolute; inset: 0; width: 38%; background: var(--ink); animation: slide 1.5s cubic-bezier(0.6, 0, 0.3, 1) infinite; }
+
+.hidden { display: none !important; }
+.rise { animation: rise 0.8s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+main > * { animation: rise 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+main > *:nth-child(2) { animation-delay: 0.08s; }
+main > *:nth-child(3) { animation-delay: 0.16s; }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(270%); } }
+@media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="brand">Silicon Paper</p>
+
+  <section id="step1" class="stage">
+    <h1>Welcome.</h1>
+    <p class="lede" id="lede"></p>
+    <div class="field">
+      <input id="key" type="password" placeholder="gsk_" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Groq API key" autofocus>
+      <button id="toggle" class="link" type="button">Show</button>
+      <button id="check" class="go" type="button" aria-label="Continue" disabled>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+      <span class="line"></span>
+    </div>
+    <p class="aside">No key yet? <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Create one in the Groq console</a></p>
+  </section>
+
+  <p class="msg" id="msg" role="status" aria-live="polite"></p>
+  <button id="skip" class="link hidden" type="button">Continue without checking</button>
+
+  <section id="step2" class="stage hidden">
+    <p class="label">Model</p>
+    <div class="field">
+      <select id="model" aria-label="Model"></select>
+      <span class="line"></span>
+    </div>
+    <button id="save" class="pill" type="button">Begin</button>
+  </section>
+
+  <div class="bar hidden" id="bar"></div>
+
+  <p class="foot" id="foot"></p>
+</main>
+
+<script type="application/json" id="state">__SETUP_STATE__</script>
+<script>
+const STATE = JSON.parse(document.getElementById('state').textContent);
+const TOKEN = document.querySelector('meta[name="setup-token"]').content;
+const $ = (id) => document.getElementById(id);
+let verifiedKey = null;
+
+$('lede').textContent = STATE.envExists
+  ? 'Your .env has no Groq key yet. Paste one to begin.'
+  : 'Paste your Groq key to begin.';
+$('foot').textContent = 'Your key is stored only on this computer, in your local .env file, and is sent nowhere but Groq.';
+$('foot').title = STATE.envPath;
+
+function setMsg(text, kind) {
+  const m = $('msg');
+  m.textContent = text || '';
+  m.className = 'msg' + (kind ? ' ' + kind : '');
+}
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Setup-Token': TOKEN },
+    body: JSON.stringify(body)
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    const err = new Error(data.error || ('Request failed (HTTP ' + r.status + ')'));
+    err.canSkip = !!data.can_skip;
+    throw err;
+  }
+  return data;
+}
+
+function fillModels(list, preferred) {
+  const sel = $('model');
+  sel.textContent = '';
+  list.forEach((id) => {
+    const o = document.createElement('option');
+    o.value = id;
+    o.textContent = id;
+    sel.appendChild(o);
+  });
+  sel.value = list.includes(preferred) ? preferred : list[0];
+}
+
+function showStep2() {
+  const s = $('step2');
+  s.classList.remove('hidden');
+  s.classList.remove('rise');
+  void s.offsetWidth;            // restart the entrance animation
+  s.classList.add('rise');
+  $('save').focus();
+}
+
+$('toggle').onclick = () => {
+  const k = $('key');
+  const hide = k.type === 'text';
+  k.type = hide ? 'password' : 'text';
+  $('toggle').textContent = hide ? 'Show' : 'Hide';
+  k.focus();
+};
+
+$('key').addEventListener('input', () => {
+  const v = $('key').value.trim();
+  $('check').disabled = !v;
+  if (verifiedKey !== null && v !== verifiedKey) {
+    verifiedKey = null;
+    $('step2').classList.add('hidden');
+  }
+  $('skip').classList.add('hidden');
+  setMsg('');
+});
+$('key').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('check').disabled) $('check').click(); });
+$('model').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('save').click(); });
+
+$('check').onclick = async () => {
+  const key = $('key').value.trim();
+  if (!key) return;
+  $('check').disabled = true;
+  $('check').classList.add('busy');
+  setMsg('Checking with Groq');
+  try {
+    const r = await api('/api/check', { key });
+    fillModels(r.models, r.default);
+    verifiedKey = key;
+    setMsg('Key verified.', 'ok');
+    showStep2();
+  } catch (e) {
+    setMsg(e.message, 'err');
+    if (e.canSkip) $('skip').classList.remove('hidden');
+  } finally {
+    $('check').classList.remove('busy');
+    $('check').disabled = !$('key').value.trim();
+  }
+};
+
+$('skip').onclick = () => {
+  const key = $('key').value.trim();
+  if (!key) return;
+  fillModels([STATE.defaultModel], STATE.defaultModel);
+  verifiedKey = key;
+  $('skip').classList.add('hidden');
+  setMsg('Not verified. Paper will tell you if the key turns out to be wrong.');
+  showStep2();
+};
+
+$('save').onclick = async () => {
+  $('save').disabled = true;
+  setMsg('Saving');
+  try {
+    await api('/api/save', { key: $('key').value.trim(), model: $('model').value });
+    $('step1').classList.add('hidden');
+    $('step2').classList.add('hidden');
+    $('skip').classList.add('hidden');
+    $('foot').classList.add('hidden');
+    $('bar').classList.remove('hidden');
+    setMsg('Starting Paper', 'ok');
+    waitForPaper();
+  } catch (e) {
+    setMsg(e.message, 'err');
+    $('save').disabled = false;
+  }
+};
+
+async function waitForPaper() {
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000) {
+    try {
+      const r = await fetch('/api/ping', { cache: 'no-store' });
+      const j = await r.json();
+      if (j.app === 'paper') { location.replace('/'); return; }
+    } catch (e) { /* server is switching over, keep waiting */ }
+    await new Promise((res) => setTimeout(res, 700));
+  }
+  $('bar').classList.add('hidden');
+  setMsg('Paper is taking longer than expected to start. Check the terminal window for details.', 'err');
+}
+</script>
+</body>
+</html>
+"""
+
+
+def _run_setup_wizard(reason):
+    """Serve the setup page, block until the key is saved, then shut the page server down."""
+    global SETUP_HANDLES_BROWSER
+    token = secrets.token_urlsafe(24)
+    done = threading.Event()
+    in_codespaces = os.environ.get("CODESPACES", "").lower() == "true"
+    host = os.environ.get("PAPER_HOST") or ("0.0.0.0" if in_codespaces else "127.0.0.1")
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    state = {"envExists": os.path.isfile(_ENV_PATH), "envPath": _ENV_PATH, "defaultModel": _DEFAULT_MODEL}
+    page = (_SETUP_PAGE
+            .replace("__SETUP_TOKEN__", token)
+            .replace("__SETUP_STATE__", json.dumps(state).replace("<", "\\u003c")))
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "SiliconPaperSetup/1.0"
+
+        def log_message(self, fmt, *args):
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            data = body if isinstance(body, bytes) else str(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj, ensure_ascii=False))
+
+        def _host_ok(self):
+            if not loopback:
+                return True
+            h = (self.headers.get("Host") or "").lower()
+            name = h.split("]")[0] + "]" if h.startswith("[") else h.rsplit(":", 1)[0]
+            return name in ("localhost", "127.0.0.1", "[::1]")
+
+        def _authed(self):
+            tok = (self.headers.get("X-Setup-Token") or "").encode("utf-8")
+            return secrets.compare_digest(tok, token.encode("utf-8"))
+
+        def _body(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 100_000:
+                    return None
+                data = json.loads((self.rfile.read(n) if n else b"").decode("utf-8") or "{}")
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+
+        def do_HEAD(self):
+            self.do_GET()
+
+        def do_GET(self):
+            if not self._host_ok():
+                return self._json(403, {"error": "Forbidden host"})
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                return self._send(200, page, "text/html; charset=utf-8")
+            if path == "/api/ping":
+                return self._json(200, {"app": "setup"})
+            if path == "/favicon.ico":
+                return self._send(204, b"", "image/x-icon")
+            return self._send(404, "Not found", "text/plain; charset=utf-8")
+
+        def do_POST(self):
+            if not self._host_ok():
+                return self._json(403, {"error": "Forbidden host"})
+            path = urlparse(self.path).path
+            if not self._authed():
+                return self._json(403, {"error": "Missing or wrong session token. Reload the page."})
+            body = self._body()
+            if body is None:
+                return self._json(400, {"error": "Bad request body."})
+            try:
+                key = _clean_key(body.get("key"))
+                if path in ("/api/check", "/api/save") and not _KEY_RE.match(key):
+                    return self._json(400, {"error": "That doesn't look like a Groq key. "
+                                                     "It starts with gsk_ and has no spaces."})
+
+                if path == "/api/check":
+                    models, err, can_skip = _check_groq_key(key)
+                    if err:
+                        return self._json(400, {"error": err, "can_skip": can_skip})
+                    return self._json(200, {"ok": True, "models": models, "default": _DEFAULT_MODEL})
+
+                if path == "/api/save":
+                    model = body.get("model") or _DEFAULT_MODEL
+                    if not isinstance(model, str) or not _MODEL_RE.match(model.strip()):
+                        return self._json(400, {"error": "That model name isn't valid."})
+                    model = model.strip()
+                    try:
+                        _write_env({"GROQ_API_KEY": key, "PAPER_MODEL": model})
+                    except OSError as e:
+                        return self._json(500, {"error": f"Couldn't write {_ENV_PATH}: {e}. "
+                                                         "Check that the folder is writable."})
+                    os.environ["GROQ_API_KEY"] = key
+                    os.environ["PAPER_MODEL"] = model
+                    print(f"   ✅ Saved your settings to {_ENV_PATH}")
+                    _protect_env_in_git()
+                    self._json(200, {"ok": True})
+                    done.set()
+                    return
+            except Exception as e:
+                return self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            return self._json(404, {"error": "Unknown endpoint."})
+
+    class SetupServer(ThreadingHTTPServer):
+        daemon_threads = True
+        # On Windows SO_REUSEADDR lets two programs share a port, which would defeat the port search.
+        allow_reuse_address = (os.name != "nt")
+
+    try:
+        first_port = int(os.environ.get("PAPER_PORT", "8000"))
+    except ValueError:
+        first_port = 8000
+    srv = None
+    for port in range(first_port, first_port + 20):
+        try:
+            srv = SetupServer((host, port), Handler)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        raise SystemExit(f"❌ No free port in {first_port}-{first_port + 19}. "
+                         "Set PAPER_PORT to another number and run again.")
+
+    url = f"http://localhost:{port}"
+    print("=" * 55)
+    print("🔑 Paper needs a Groq API key before it can start")
+    print(f"   ({reason})")
+    print(f"   Finish the setup in your browser: {url}")
+    if in_codespaces:
+        cs_name = os.environ.get("CODESPACE_NAME")
+        cs_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
+        if cs_name:
+            print(f"   Codespaces link: https://{cs_name}-{port}.{cs_domain}")
+        print("   (Or open the PORTS tab and click the globe icon. Keep the port Private.)")
+    print("   Ctrl+C cancels.")
+    print("=" * 55)
+
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True).start()
+    if _should_open_browser():
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    try:
+        while not done.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        srv.shutdown()
+        srv.server_close()
+        print("\n⚡ Setup cancelled. Run paper.py again whenever you're ready.")
+        raise SystemExit(0)
+
+    time.sleep(0.4)                     # let the browser receive the "saved" reply
+    srv.shutdown()
+    srv.server_close()
+    # Paper will now start on this same port; the setup page redirects there by itself.
+    os.environ["PAPER_PORT"] = str(port)
+    SETUP_HANDLES_BROWSER = True
+
+
+def ensure_environment():
+    _ensure_packages()
+    from dotenv import load_dotenv
+    reason = None
+    if _FORCE_SETUP:
+        reason = "you started Paper with --setup"
+    else:
+        load_dotenv(_ENV_PATH)
+        if _key_is_missing(os.environ.get("GROQ_API_KEY")):
+            reason = (".env has no GROQ_API_KEY" if os.path.isfile(_ENV_PATH)
+                      else "no .env file found yet")
+    if reason:
+        _run_setup_wizard(reason)
+
+
+ensure_environment()
+
+from dotenv import load_dotenv
+from groq import Groq
+
 # Load API key from the .env file beside this script
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(_ENV_PATH)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY. Check the .env file beside paper.py")
+    raise RuntimeError("Missing GROQ_API_KEY. Run: python paper.py --setup")
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -2050,6 +2732,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
 
+        if path == "/api/ping":          # no token needed; used by the first-run setup page
+            return self._json(200, {"app": "paper"})
+
         if not path.startswith("/api/"):
             return self._send(404, "Not found", "text/plain; charset=utf-8")
         if not self._authed():
@@ -2147,15 +2832,6 @@ class PaperServer(ThreadingHTTPServer):
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
             return
         super().handle_error(request, client_address)
-
-
-def _should_open_browser():
-    if os.environ.get("PAPER_NO_BROWSER"):
-        return False
-    if sys.platform.startswith("linux") and not (
-            os.environ.get("BROWSER") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return False    # headless Linux: webbrowser could launch a text browser in this terminal
-    return True
 
 
 def serve():
