@@ -14,6 +14,11 @@ import platform
 import importlib
 import importlib.util
 import site
+import socket
+import ssl
+import types
+import urllib.error
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -27,23 +32,23 @@ except Exception:
 
 # ------------------------------------------------------------------
 # First-run setup
-# Runs BEFORE python-dotenv / groq are imported, so a fresh machine works:
-#   1. missing Python tools (python-dotenv, groq) are installed automatically
-#   2. if there is no .env (or it has no Groq key) a small setup page opens in
-#      the browser, checks the key with Groq, and writes the .env for you
-# Run `python paper.py --setup` any time to repeat step 2 (e.g. to change the key).
+# Runs BEFORE python-dotenv is imported, so a fresh machine works:
+#   1. the missing Python tool (python-dotenv) is installed automatically
+#   2. if .env doesn't name an AI provider (or lacks its key) a small setup page opens in
+#      the browser, asks "Groq or another provider?", checks the key, and writes the .env
+# Run `python paper.py --setup` any time to repeat step 2 (change provider, key or model).
 # Set PAPER_NO_AUTOINSTALL=1 to stop it from installing anything itself.
 # ------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_HERE, ".env")
-_REQUIRED_PACKAGES = {"dotenv": "python-dotenv", "groq": "groq"}   # import name -> pip name
-_DEFAULT_MODEL = "openai/gpt-oss-20b"
+_REQUIRED_PACKAGES = {"dotenv": "python-dotenv"}   # import name -> pip name
 _FORCE_SETUP = "--setup" in sys.argv[1:]
 SETUP_HANDLES_BROWSER = False    # True once the setup page is open and will redirect itself
 
-_KEY_RE = re.compile(r"^[A-Za-z0-9_\-]{16,200}$")
+_KEY_RE = re.compile(r"^[^\s\"']{8,500}$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9_\-./:]{1,100}$")
-_NON_CHAT_HINTS = ("whisper", "tts", "guard", "orpheus", "playai", "embed")
+_NON_CHAT_HINTS = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "moderation", "dall-e",
+                   "image", "audio", "transcribe", "realtime", "rerank", "davinci", "babbage")
 _PLACEHOLDER_HINTS = ("your", "here", "xxxx", "changeme", "paste", "insert", "example", "<")
 
 
@@ -258,23 +263,336 @@ def _ensure_packages():
     print("   ✅ Installed: " + ", ".join(missing))
 
 
-# ---- step 2: .env + Groq key --------------------------------------
-def _key_is_missing(value):
+# ---- AI providers --------------------------------------------------
+# Paper talks to its model through a tiny built-in client (standard library only, no vendor SDK),
+# so ANY provider works by changing .env. Most providers speak the OpenAI "chat/completions"
+# protocol; Anthropic has its own, which is handled natively below.
+#
+#   PAPER_PROVIDER   groq | openai | anthropic | gemini | openrouter | mistral | deepseek | xai |
+#                    together | cerebras | fireworks | ollama | lmstudio | custom
+#   <PROVIDER>_API_KEY   e.g. GROQ_API_KEY, OPENAI_API_KEY ... (or the generic PAPER_API_KEY)
+#   PAPER_MODEL      model id to use
+#   PAPER_BASE_URL   only for ollama / lmstudio / custom (any OpenAI-compatible server)
+PROVIDERS = {
+    "groq": dict(label="Groq", kind="openai", base_url="https://api.groq.com/openai/v1",
+                 key_env="GROQ_API_KEY", key_prefix="gsk_", default_model="openai/gpt-oss-20b",
+                 key_url="https://console.groq.com/keys"),
+    "openai": dict(label="OpenAI", kind="openai", base_url="https://api.openai.com/v1",
+                   key_env="OPENAI_API_KEY", key_prefix="sk-", default_model="gpt-4o-mini",
+                   key_url="https://platform.openai.com/api-keys"),
+    "anthropic": dict(label="Anthropic (Claude)", kind="anthropic", base_url="https://api.anthropic.com/v1",
+                      key_env="ANTHROPIC_API_KEY", key_prefix="sk-ant-", default_model="claude-sonnet-5-5",
+                      key_url="https://console.anthropic.com/settings/keys"),
+    "gemini": dict(label="Google Gemini", kind="openai",
+                   base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                   key_env="GEMINI_API_KEY", key_prefix="AIza", default_model="gemini-2.5-flash",
+                   key_url="https://aistudio.google.com/apikey"),
+    "openrouter": dict(label="OpenRouter", kind="openai", base_url="https://openrouter.ai/api/v1",
+                       key_env="OPENROUTER_API_KEY", key_prefix="sk-or-", default_model="openai/gpt-oss-20b",
+                       key_url="https://openrouter.ai/keys"),
+    "mistral": dict(label="Mistral", kind="openai", base_url="https://api.mistral.ai/v1",
+                    key_env="MISTRAL_API_KEY", key_prefix="", default_model="mistral-small-latest",
+                    key_url="https://console.mistral.ai/api-keys"),
+    "deepseek": dict(label="DeepSeek", kind="openai", base_url="https://api.deepseek.com/v1",
+                     key_env="DEEPSEEK_API_KEY", key_prefix="sk-", default_model="deepseek-chat",
+                     key_url="https://platform.deepseek.com/api_keys"),
+    "xai": dict(label="xAI (Grok)", kind="openai", base_url="https://api.x.ai/v1",
+                key_env="XAI_API_KEY", key_prefix="xai-", default_model="grok-3-mini",
+                key_url="https://console.x.ai"),
+    "together": dict(label="Together AI", kind="openai", base_url="https://api.together.xyz/v1",
+                     key_env="TOGETHER_API_KEY", key_prefix="", default_model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                     key_url="https://api.together.ai/settings/api-keys"),
+    "cerebras": dict(label="Cerebras", kind="openai", base_url="https://api.cerebras.ai/v1",
+                     key_env="CEREBRAS_API_KEY", key_prefix="csk-", default_model="llama-3.3-70b",
+                     key_url="https://cloud.cerebras.ai"),
+    "fireworks": dict(label="Fireworks AI", kind="openai", base_url="https://api.fireworks.ai/inference/v1",
+                      key_env="FIREWORKS_API_KEY", key_prefix="fw_",
+                      default_model="accounts/fireworks/models/llama-v3p3-70b-instruct",
+                      key_url="https://fireworks.ai/account/api-keys"),
+    "ollama": dict(label="Ollama (local)", kind="openai", base_url="http://localhost:11434/v1",
+                   key_env="OLLAMA_API_KEY", key_prefix="", default_model="", local=True, no_key=True,
+                   note="No key needed. Make sure Ollama is running and you have pulled a model."),
+    "lmstudio": dict(label="LM Studio (local)", kind="openai", base_url="http://localhost:1234/v1",
+                     key_env="LMSTUDIO_API_KEY", key_prefix="", default_model="", local=True, no_key=True,
+                     note="No key needed. Start the LM Studio server and load a model first."),
+    "custom": dict(label="Other (any OpenAI-compatible URL)", kind="openai", base_url="",
+                   key_env="PAPER_API_KEY", key_prefix="", default_model="", url_editable=True, key_optional=True,
+                   note="Works with vLLM, llama.cpp, LiteLLM, Azure gateways and anything else that "
+                        "speaks the OpenAI chat API. The URL usually ends in /v1."),
+}
+for _name, _spec in PROVIDERS.items():
+    _spec.setdefault("local", False)
+    _spec.setdefault("no_key", False)
+    _spec.setdefault("key_optional", False)
+    _spec.setdefault("note", "")
+    _spec.setdefault("key_url", "")
+    _spec["needs_key"] = not (_spec["no_key"] or _spec["key_optional"])
+    _spec["url_editable"] = bool(_spec.get("url_editable") or _spec["local"])
+PROVIDER_ORDER = list(PROVIDERS)
+
+# Every variable that can hold a key: removed from the environment of terminal commands Paper runs.
+_SECRET_ENV_NAMES = {s["key_env"] for s in PROVIDERS.values()} | {"PAPER_API_KEY"}
+
+_USER_AGENT = "Mozilla/5.0 (compatible; SiliconPaper/1.0)"   # some API gateways block the default Python agent
+_BASE_URL_RE = re.compile(r"^https?://[^\s\"']+$")
+
+
+class LLMError(Exception):
+    def __init__(self, message, status_code=None, retry_after=None, transient=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.transient = transient
+
+
+def _ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _api_error_text(raw):
+    """Pull a readable message out of a provider's error body."""
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return (raw or b"").decode("utf-8", errors="replace").strip()[:300]
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        err = data.get("error", data)
+        if isinstance(err, dict):
+            return str(err.get("message") or err.get("detail") or err)[:300]
+        if isinstance(err, str):
+            return err[:300]
+        return str(data.get("message") or data.get("detail") or data)[:300]
+    return str(data)[:300]
+
+
+def _http_json(method, url, headers, body=None, timeout=60):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    host = urlparse(url).netloc
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+        except Exception:
+            raw = b""
+        retry_after = None
+        try:
+            ra = float(e.headers.get("Retry-After"))
+            retry_after = ra if 0 <= ra <= 20 else None
+        except (TypeError, ValueError, AttributeError):
+            pass
+        raise LLMError(_api_error_text(raw) or str(e.reason), e.code, retry_after=retry_after)
+    except urllib.error.URLError as e:
+        reason = e.reason
+        hint = ""
+        if isinstance(reason, ssl.SSLError):
+            hint = (" (Python can't verify HTTPS certificates. On macOS run 'Install Certificates.command' "
+                    "from your Python folder, or: pip install certifi)")
+        raise LLMError(f"Can't reach {host}: {reason}{hint}", None,
+                       transient=isinstance(reason, (socket.timeout, TimeoutError, ConnectionResetError)))
+    except (socket.timeout, TimeoutError):
+        raise LLMError(f"The request to {host} timed out.", None, transient=True)
+    except OSError as e:
+        raise LLMError(f"Can't reach {host}: {e}", None)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise LLMError("The server's reply wasn't JSON: " + raw.decode("utf-8", errors="replace")[:200])
+
+
+def _content_text(content):
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    else:
+        text = str(content)
+    # Reasoning models sometimes inline their thinking; the planner only wants the answer.
+    return re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>\s*", "", text, flags=re.S)
+
+
+class _Msg:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Choice:
+    def __init__(self, content):
+        self.message = _Msg(content)
+
+
+class _Resp:
+    def __init__(self, content):
+        self.choices = [_Choice(content)]
+
+
+class LLMClient:
+    """Drop-in for the bits of an SDK client Paper uses: client.chat.completions.create(...)."""
+
+    def __init__(self, provider, api_key, base_url=None, timeout=180.0, max_retries=2):
+        spec = PROVIDERS[provider]
+        self.provider, self.kind = provider, spec["kind"]
+        self.api_key = (api_key or "").strip()
+        self.base_url = (base_url or spec["base_url"] or "").strip().rstrip("/")
+        self.timeout, self.max_retries = timeout, max_retries
+        self._no_temp = set()      # models that refuse a temperature setting
+        self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self._create))
+
+    def _headers(self):
+        h = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _USER_AGENT}
+        if self.kind == "anthropic":
+            h["x-api-key"] = self.api_key
+            h["anthropic-version"] = "2023-06-01"
+        elif self.api_key:
+            h["Authorization"] = "Bearer " + self.api_key
+        return h
+
+    def _request(self, method, path, body=None):
+        url = self.base_url + path
+        attempt = 0
+        while True:
+            try:
+                return _http_json(method, url, self._headers(), body, self.timeout)
+            except LLMError as e:
+                retryable = e.status_code in (429, 500, 502, 503, 504) or (e.status_code is None and e.transient)
+                if attempt >= self.max_retries or not retryable:
+                    raise
+                time.sleep(e.retry_after if e.retry_after is not None else 1.5 * (2 ** attempt))
+                attempt += 1
+
+    def _post(self, path, body, model):
+        try:
+            return self._request("POST", path, body)
+        except LLMError as e:
+            # Some models (o-series, gpt-5, newer Claude) reject temperature: remember and retry without it.
+            if e.status_code == 400 and "temperature" in body and "temperature" in str(e).lower():
+                self._no_temp.add(model)
+                body = {k: v for k, v in body.items() if k != "temperature"}
+                return self._request("POST", path, body)
+            raise
+
+    def _create(self, messages, model, temperature=None, **extra):
+        if self.kind == "anthropic":
+            system = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
+            body = {"model": model, "max_tokens": 8192,
+                    "messages": [{"role": m["role"], "content": m["content"]}
+                                 for m in messages if m.get("role") != "system"]}
+            if system:
+                body["system"] = system
+            body.update(extra)
+            if temperature is not None and model not in self._no_temp:
+                body["temperature"] = temperature
+            data = self._post("/messages", body, model)
+            blocks = data.get("content") if isinstance(data, dict) else None
+            text = "".join(b.get("text", "") for b in (blocks or [])
+                           if isinstance(b, dict) and b.get("type") == "text")
+            return _Resp(_content_text(text))
+
+        body = {"model": model, "messages": messages}
+        body.update(extra)
+        if temperature is not None and model not in self._no_temp:
+            body["temperature"] = temperature
+        data = self._post("/chat/completions", body, model)
+        try:
+            return _Resp(_content_text(data["choices"][0]["message"].get("content")))
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise LLMError("The provider's reply had no message: " + json.dumps(data, default=str)[:300])
+
+    def list_models(self):
+        data = self._request("GET", "/models?limit=100" if self.kind == "anthropic" else "/models")
+        items = data if isinstance(data, list) else (data.get("data") or data.get("models") or [])
+        ids = set()
+        for m in items:
+            if isinstance(m, str):
+                mid = m
+            elif isinstance(m, dict):
+                if str(m.get("type") or "").lower() in ("embedding", "embeddings", "image", "audio",
+                                                         "moderation", "rerank", "transcribe", "tts"):
+                    continue
+                mid = m.get("id") or m.get("name") or ""
+            else:
+                continue
+            mid = str(mid)
+            if mid.startswith("models/"):          # Gemini lists ids as "models/<id>"
+                mid = mid[len("models/"):]
+            if mid and not any(h in mid.lower() for h in _NON_CHAT_HINTS):
+                ids.add(mid)
+        return sorted(ids)
+
+
+# ---- step 2: .env + provider --------------------------------------
+def _resolve_provider():
+    """Provider named in the environment, or None. A .env from before providers existed
+    (only GROQ_API_KEY) keeps working as Groq."""
+    name = (os.environ.get("PAPER_PROVIDER") or "").strip().lower()
+    if name:
+        return name if name in PROVIDERS else None
+    if not _key_is_missing("groq", os.environ.get("GROQ_API_KEY")):
+        return "groq"
+    return None
+
+
+def _api_key_for(provider):
+    key = os.environ.get(PROVIDERS[provider]["key_env"]) or os.environ.get("PAPER_API_KEY") or ""
+    return key.strip().strip("\"'").strip()
+
+
+def _base_url_for(provider):
+    spec = PROVIDERS[provider]
+    if spec["url_editable"]:
+        return (os.environ.get("PAPER_BASE_URL") or spec["base_url"] or "").strip().rstrip("/")
+    return spec["base_url"]
+
+
+def _model_for(provider):
+    return (os.environ.get("PAPER_MODEL") or PROVIDERS[provider]["default_model"] or "").strip()
+
+
+def _key_is_missing(provider, value):
     v = (value or "").strip().strip("\"'")
     if not v:
         return True
-    # Real Groq keys start with gsk_, so those are never mistaken for a placeholder
-    return (not v.startswith("gsk_")) and any(h in v.lower() for h in _PLACEHOLDER_HINTS)
+    prefix = PROVIDERS[provider]["key_prefix"]
+    # A key with the provider's real prefix is never mistaken for a placeholder
+    return (not (prefix and v.startswith(prefix))) and any(h in v.lower() for h in _PLACEHOLDER_HINTS)
+
+
+def _config_problem():
+    """None when the environment is fully set up, otherwise a short reason."""
+    provider = _resolve_provider()
+    if provider is None:
+        bad = (os.environ.get("PAPER_PROVIDER") or "").strip()
+        if bad:
+            return f"PAPER_PROVIDER '{bad}' is not a provider Paper knows"
+        return "no provider chosen in .env" if os.path.isfile(_ENV_PATH) else "no .env file found yet"
+    spec = PROVIDERS[provider]
+    if spec["needs_key"] and _key_is_missing(provider, _api_key_for(provider)):
+        return f".env has no {spec['key_env']}"
+    if not _base_url_for(provider):
+        return "no base URL set (PAPER_BASE_URL)"
+    if not _model_for(provider):
+        return "no model set (PAPER_MODEL)"
+    return None
 
 
 def _clean_key(raw):
-    """Accepts a bare key or a pasted 'GROQ_API_KEY=...' line, with or without quotes."""
+    """Accepts a bare key or a pasted 'SOMETHING_API_KEY=...' line, with or without quotes."""
     k = raw.strip() if isinstance(raw, str) else ""
-    k = re.sub(r"^(?:export\s+)?GROQ_API_KEY\s*=\s*", "", k)
+    k = re.sub(r"^(?:export\s+)?[A-Za-z0-9_]*API_KEY\s*=\s*", "", k)
     return k.strip().strip("\"'").strip()
 
 
-def _write_env(updates):
+def _write_env(updates, remove=()):
     """Create or update .env beside paper.py. Other lines are kept; only the given keys change."""
     lines = []
     if os.path.isfile(_ENV_PATH):
@@ -283,9 +601,12 @@ def _write_env(updates):
     seen, out = set(), []
     for line in lines:
         m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
-        if m and m.group(1) in updates:
-            out.append(f"{m.group(1)}={updates[m.group(1)]}")
-            seen.add(m.group(1))
+        name = m.group(1) if m else None
+        if name in remove:
+            continue
+        if name in updates:
+            out.append(f"{name}={updates[name]}")
+            seen.add(name)
         else:
             out.append(line)
     for k, v in updates.items():
@@ -328,23 +649,39 @@ def _protect_env_in_git():
         pass
 
 
-def _check_groq_key(key):
-    """Ask Groq for the model list. Returns (chat_model_ids, error_message, can_skip)."""
-    from groq import Groq
+def _effective_base_url(spec, raw):
+    """Returns (url, error). Fixed providers always use their own URL."""
+    if not spec["url_editable"]:
+        return spec["base_url"], None
+    url = (raw.strip() if isinstance(raw, str) else "").rstrip("/") or spec["base_url"]
+    if not url:
+        return None, "Enter the server's base URL (it usually ends in /v1)."
+    if not _BASE_URL_RE.match(url):
+        return None, "That doesn't look like a URL. It should start with http:// or https://"
+    return url, None
+
+
+def _check_provider(provider, key, base_url):
+    """Ask the provider for its model list. Returns (chat_model_ids, error_message, can_skip)."""
+    spec = PROVIDERS[provider]
+    label = spec["label"]
     try:
-        resp = Groq(api_key=key, timeout=15.0, max_retries=0).models.list()
-    except Exception as e:
-        status = getattr(e, "status_code", None)
-        if status == 401:
-            return None, ("Groq rejected that key. Make sure you copied all of it "
-                          "(it starts with gsk_) and that it hasn't been deleted."), False
-        what = f"HTTP {status}" if status else type(e).__name__
-        return None, f"Couldn't verify the key with Groq ({what}). Check your internet connection and try again.", True
-    ids = sorted({m.id for m in resp.data if not any(h in m.id.lower() for h in _NON_CHAT_HINTS)})
-    if _DEFAULT_MODEL in ids:
-        ids.remove(_DEFAULT_MODEL)
-        ids.insert(0, _DEFAULT_MODEL)
-    return (ids or [_DEFAULT_MODEL]), None, False
+        ids = LLMClient(provider, key, base_url, timeout=15.0, max_retries=0).list_models()
+    except LLMError as e:
+        status = e.status_code
+        if status in (401, 403):
+            return None, (f"{label} rejected that key. Make sure you copied all of it "
+                          "and that it hasn't been deleted."), False
+        if status is None:
+            if spec["local"] or provider == "custom":
+                return None, f"Couldn't reach {base_url}. Is the server running?", True
+            return None, f"Couldn't reach {label}. Check your internet connection and try again.", True
+        return None, f"Couldn't verify with {label} (HTTP {status}: {e}).", True
+    default = spec["default_model"]
+    if default in ids:
+        ids.remove(default)
+        ids.insert(0, default)
+    return ids, None, False
 
 
 _SETUP_PAGE = r"""<!DOCTYPE html>
@@ -378,11 +715,12 @@ h1 {
 .lede { color: var(--mute); font-size: 16px; line-height: 1.5; margin: 14px 0 38px; }
 
 .field { position: relative; display: flex; align-items: center; gap: 14px; padding-bottom: 16px; border-bottom: 1px solid var(--hair); }
+.field + .field { margin-top: 26px; }
 .field .line { position: absolute; left: 0; bottom: -1px; height: 1px; width: 100%; background: var(--ink); transform: scaleX(0); transform-origin: left; transition: transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1); }
 .field:focus-within .line { transform: scaleX(1); }
 
 input, select { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font: inherit; color: var(--ink); padding: 0; }
-input { font-size: 22px; letter-spacing: 0.02em; }
+input { font-size: 20px; letter-spacing: 0.02em; }
 input::placeholder { color: var(--faint); letter-spacing: 0.04em; }
 select {
   font-size: 18px; cursor: pointer; -webkit-appearance: none; appearance: none; padding-right: 26px;
@@ -393,22 +731,24 @@ button { font: inherit; cursor: pointer; border: 0; background: none; color: inh
 .link { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mute); transition: color 0.25s; white-space: nowrap; }
 .link:hover { color: var(--ink); }
 
-.go { flex-shrink: 0; width: 46px; height: 46px; border-radius: 50%; background: var(--ink); color: #fff; display: grid; place-items: center; transition: transform 0.3s cubic-bezier(0.2, 0.7, 0.2, 1), background 0.3s, opacity 0.3s; }
-.go:hover:not(:disabled) { transform: translateX(3px); }
-.go:disabled { background: var(--hair); cursor: default; }
-.go.busy svg { display: none; }
-.go.busy::after { content: ''; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid rgba(255, 255, 255, 0.35); border-top-color: #fff; animation: spin 0.8s linear infinite; }
-
 .pill { margin-top: 36px; background: var(--ink); color: #fff; font-size: 13px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; padding: 16px 34px; border-radius: 999px; transition: transform 0.3s cubic-bezier(0.2, 0.7, 0.2, 1), opacity 0.3s; }
 .pill:hover:not(:disabled) { transform: translateY(-1px); }
-.pill:disabled { opacity: 0.45; cursor: default; }
+.pill:disabled { opacity: 0.35; cursor: default; }
 
-.aside { margin-top: 22px; font-size: 13px; color: var(--mute); }
+.choices { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 26px; }
+.choice { font-size: 15px; padding: 12px 22px; border-radius: 999px; border: 1px solid var(--hair); color: var(--mute); transition: all 0.25s; }
+.choice:hover { color: var(--ink); border-color: var(--faint); }
+.choice.on { background: var(--ink); border-color: var(--ink); color: #fff; }
+
+.aside { margin-top: 22px; font-size: 13px; line-height: 1.55; color: var(--mute); }
 a { color: var(--ink); text-decoration: none; background: linear-gradient(var(--ink), var(--ink)) 0 100% / 100% 1px no-repeat; padding-bottom: 1px; transition: background-size 0.4s; }
 a:hover { background-size: 0 1px; }
 
-#step2 { margin-top: 44px; }
+#step1, #step2 { margin-top: 0; }
+#step2 { margin-top: 40px; }
 .label { font-size: 11px; font-weight: 500; letter-spacing: 0.3em; text-transform: uppercase; color: var(--mute); margin-bottom: 18px; }
+#back { display: block; margin-bottom: 30px; }
+#typeModel { margin-top: 14px; }
 
 .msg { min-height: 20px; margin-top: 22px; font-size: 13px; letter-spacing: 0.01em; line-height: 1.5; color: var(--mute); }
 .msg.err { color: var(--err); }
@@ -425,7 +765,6 @@ main > * { animation: rise 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
 main > *:nth-child(2) { animation-delay: 0.08s; }
 main > *:nth-child(3) { animation-delay: 0.16s; }
 @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
-@keyframes spin { to { transform: rotate(360deg); } }
 @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(270%); } }
 @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
 </style>
@@ -434,18 +773,35 @@ main > *:nth-child(3) { animation-delay: 0.16s; }
 <main>
   <p class="brand">Silicon Paper</p>
 
-  <section id="step1" class="stage">
+  <section id="stepP" class="stage">
     <h1>Welcome.</h1>
     <p class="lede" id="lede"></p>
-    <div class="field">
-      <input id="key" type="password" placeholder="gsk_" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Groq API key" autofocus>
-      <button id="toggle" class="link" type="button">Show</button>
-      <button id="check" class="go" type="button" aria-label="Continue" disabled>
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-      </button>
+    <p class="label">Which AI provider?</p>
+    <div class="choices">
+      <button id="optGroq" class="choice on" type="button">Groq</button>
+      <button id="optOther" class="choice" type="button">Another provider</button>
+    </div>
+    <div class="field hidden" id="otherWrap">
+      <select id="provider" aria-label="Provider"></select>
       <span class="line"></span>
     </div>
-    <p class="aside">No key yet? <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Create one in the Groq console</a></p>
+    <button id="next" class="pill" type="button">Continue</button>
+  </section>
+
+  <section id="step1" class="stage hidden">
+    <button id="back" class="link" type="button">&larr; Change provider</button>
+    <p class="label" id="provLabel"></p>
+    <div class="field hidden" id="urlField">
+      <input id="url" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Base URL">
+      <span class="line"></span>
+    </div>
+    <div class="field hidden" id="keyField">
+      <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="API key">
+      <button id="toggle" class="link" type="button">Show</button>
+      <span class="line"></span>
+    </div>
+    <p class="aside" id="aside"></p>
+    <button id="verify" class="pill" type="button" disabled>Verify</button>
   </section>
 
   <p class="msg" id="msg" role="status" aria-live="polite"></p>
@@ -453,10 +809,15 @@ main > *:nth-child(3) { animation-delay: 0.16s; }
 
   <section id="step2" class="stage hidden">
     <p class="label">Model</p>
-    <div class="field">
-      <select id="model" aria-label="Model"></select>
+    <div class="field" id="selField">
+      <select id="modelSel" aria-label="Model"></select>
       <span class="line"></span>
     </div>
+    <div class="field hidden" id="txtField">
+      <input id="modelTxt" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="model name" aria-label="Model name">
+      <span class="line"></span>
+    </div>
+    <button id="typeModel" class="link" type="button">Type a model name instead</button>
     <button id="save" class="pill" type="button">Begin</button>
   </section>
 
@@ -470,12 +831,13 @@ main > *:nth-child(3) { animation-delay: 0.16s; }
 const STATE = JSON.parse(document.getElementById('state').textContent);
 const TOKEN = document.querySelector('meta[name="setup-token"]').content;
 const $ = (id) => document.getElementById(id);
-let verifiedKey = null;
+let sel = (STATE.current && STATE.providers[STATE.current]) ? STATE.current : 'groq';
+let verified = false;
 
 $('lede').textContent = STATE.envExists
-  ? 'Your .env has no Groq key yet. Paste one to begin.'
-  : 'Paste your Groq key to begin.';
-$('foot').textContent = 'Your key is stored only on this computer, in your local .env file, and is sent nowhere but Groq.';
+  ? 'Your .env is not fully set up yet. Pick where Paper should get its AI.'
+  : 'Pick where Paper should get its AI.';
+$('foot').textContent = 'Your key is stored only on this computer, in your local .env file, and is sent nowhere but the provider you pick.';
 $('foot').title = STATE.envPath;
 
 function setMsg(text, kind) {
@@ -500,26 +862,77 @@ async function api(path, body) {
   return data;
 }
 
-function fillModels(list, preferred) {
-  const sel = $('model');
-  sel.textContent = '';
-  list.forEach((id) => {
-    const o = document.createElement('option');
-    o.value = id;
-    o.textContent = id;
-    sel.appendChild(o);
-  });
-  sel.value = list.includes(preferred) ? preferred : list[0];
+// ---- provider choice: Groq, or pick another from the list
+STATE.order.filter((id) => id !== 'groq').forEach((id) => {
+  const o = document.createElement('option');
+  o.value = id;
+  o.textContent = STATE.providers[id].label;
+  $('provider').appendChild(o);
+});
+
+function pick(other) {
+  $('optGroq').classList.toggle('on', !other);
+  $('optOther').classList.toggle('on', other);
+  $('otherWrap').classList.toggle('hidden', !other);
+  sel = other ? $('provider').value : 'groq';
+}
+$('optGroq').onclick = () => pick(false);
+$('optOther').onclick = () => pick(true);
+$('provider').onchange = () => { sel = $('provider').value; };
+if (sel !== 'groq') { $('provider').value = sel; pick(true); }
+
+function resetCheck() {
+  verified = false;
+  $('step2').classList.add('hidden');
+  $('skip').classList.add('hidden');
+  setMsg('');
+  updateVerify();
 }
 
-function showStep2() {
-  const s = $('step2');
-  s.classList.remove('hidden');
-  s.classList.remove('rise');
-  void s.offsetWidth;            // restart the entrance animation
-  s.classList.add('rise');
-  $('save').focus();
+function updateVerify() {
+  const p = STATE.providers[sel];
+  let ok = true;
+  if (p.url_editable && !$('url').value.trim()) ok = false;
+  if (p.needs_key && !$('key').value.trim()) ok = false;
+  $('verify').disabled = !ok;
 }
+
+$('next').onclick = () => {
+  const p = STATE.providers[sel];
+  $('provLabel').textContent = p.label;
+  $('urlField').classList.toggle('hidden', !p.url_editable);
+  $('url').value = p.base_url || '';
+  $('url').placeholder = p.base_url || 'https://your-server/v1';
+  const showKey = p.needs_key || p.key_optional;
+  $('keyField').classList.toggle('hidden', !showKey);
+  $('key').value = '';
+  $('key').type = 'password';
+  $('toggle').textContent = 'Show';
+  $('key').placeholder = (p.key_prefix || 'API key') + (p.key_optional ? '  (optional)' : '');
+
+  const a = $('aside');
+  a.textContent = '';
+  if (p.note) a.append(p.note + ' ');
+  if (p.key_url) {
+    a.append('No key yet? ');
+    const l = document.createElement('a');
+    l.href = p.key_url; l.target = '_blank'; l.rel = 'noopener noreferrer';
+    l.textContent = 'Create one at ' + p.label;
+    a.append(l);
+  }
+
+  $('stepP').classList.add('hidden');
+  $('step1').classList.remove('hidden');
+  resetCheck();
+  const first = showKey && !p.url_editable ? $('key') : (p.url_editable ? $('url') : $('verify'));
+  first.focus();
+};
+
+$('back').onclick = () => {
+  $('step1').classList.add('hidden');
+  $('stepP').classList.remove('hidden');
+  resetCheck();
+};
 
 $('toggle').onclick = () => {
   const k = $('key');
@@ -529,59 +942,89 @@ $('toggle').onclick = () => {
   k.focus();
 };
 
-$('key').addEventListener('input', () => {
-  const v = $('key').value.trim();
-  $('check').disabled = !v;
-  if (verifiedKey !== null && v !== verifiedKey) {
-    verifiedKey = null;
-    $('step2').classList.add('hidden');
-  }
-  $('skip').classList.add('hidden');
-  setMsg('');
+['key', 'url'].forEach((id) => {
+  $(id).addEventListener('input', resetCheck);
+  $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('verify').disabled) $('verify').click(); });
 });
-$('key').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('check').disabled) $('check').click(); });
-$('model').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('save').click(); });
+$('modelTxt').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('save').click(); });
+$('modelSel').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('save').click(); });
 
-$('check').onclick = async () => {
-  const key = $('key').value.trim();
-  if (!key) return;
-  $('check').disabled = true;
-  $('check').classList.add('busy');
-  setMsg('Checking with Groq');
+function showModelText(on) {
+  $('txtField').classList.toggle('hidden', !on);
+  $('selField').classList.toggle('hidden', on);
+  $('typeModel').classList.toggle('hidden', on || $('modelSel').options.length === 0);
+}
+
+function fillModels(list, preferred) {
+  const s = $('modelSel');
+  s.textContent = '';
+  list.forEach((id) => {
+    const o = document.createElement('option');
+    o.value = id;
+    o.textContent = id;
+    s.appendChild(o);
+  });
+  $('modelTxt').value = preferred || '';
+  if (list.length) s.value = list.includes(preferred) ? preferred : list[0];
+  showModelText(list.length === 0);
+}
+
+function showStep2() {
+  const s = $('step2');
+  s.classList.remove('hidden');
+  s.classList.remove('rise');
+  void s.offsetWidth;            // restart the entrance animation
+  s.classList.add('rise');
+  ($('txtField').classList.contains('hidden') ? $('save') : $('modelTxt')).focus();
+}
+
+$('typeModel').onclick = () => { showModelText(true); $('modelTxt').focus(); };
+
+function currentModel() {
+  return $('txtField').classList.contains('hidden') ? $('modelSel').value : $('modelTxt').value.trim();
+}
+
+function payload() {
+  return { provider: sel, key: $('key').value.trim(), base_url: $('url').value.trim() };
+}
+
+$('verify').onclick = async () => {
+  const p = STATE.providers[sel];
+  $('verify').disabled = true;
+  $('verify').textContent = 'Checking…';
+  setMsg('Checking with ' + p.label);
   try {
-    const r = await api('/api/check', { key });
+    const r = await api('/api/check', payload());
     fillModels(r.models, r.default);
-    verifiedKey = key;
-    setMsg('Key verified.', 'ok');
+    verified = true;
+    setMsg(r.models.length ? 'Connected.' : 'Connected, but no models were listed. Type a model name.', 'ok');
     showStep2();
   } catch (e) {
     setMsg(e.message, 'err');
     if (e.canSkip) $('skip').classList.remove('hidden');
   } finally {
-    $('check').classList.remove('busy');
-    $('check').disabled = !$('key').value.trim();
+    $('verify').textContent = 'Verify';
+    updateVerify();
   }
 };
 
 $('skip').onclick = () => {
-  const key = $('key').value.trim();
-  if (!key) return;
-  fillModels([STATE.defaultModel], STATE.defaultModel);
-  verifiedKey = key;
+  const p = STATE.providers[sel];
+  fillModels([], p.default_model);
+  verified = true;
   $('skip').classList.add('hidden');
-  setMsg('Not verified. Paper will tell you if the key turns out to be wrong.');
+  setMsg('Not verified. Paper will tell you if something turns out to be wrong.');
   showStep2();
 };
 
 $('save').onclick = async () => {
+  const model = currentModel();
+  if (!model) { setMsg('Choose or type a model name.', 'err'); return; }
   $('save').disabled = true;
   setMsg('Saving');
   try {
-    await api('/api/save', { key: $('key').value.trim(), model: $('model').value });
-    $('step1').classList.add('hidden');
-    $('step2').classList.add('hidden');
-    $('skip').classList.add('hidden');
-    $('foot').classList.add('hidden');
+    await api('/api/save', Object.assign(payload(), { model }));
+    ['stepP', 'step1', 'step2', 'skip', 'foot'].forEach((id) => $(id).classList.add('hidden'));
     $('bar').classList.remove('hidden');
     setMsg('Starting Paper', 'ok');
     waitForPaper();
@@ -611,14 +1054,24 @@ async function waitForPaper() {
 
 
 def _run_setup_wizard(reason):
-    """Serve the setup page, block until the key is saved, then shut the page server down."""
+    """Serve the setup page, block until a provider is saved, then shut the page server down."""
     global SETUP_HANDLES_BROWSER
     token = secrets.token_urlsafe(24)
     done = threading.Event()
     in_codespaces = os.environ.get("CODESPACES", "").lower() == "true"
     host = os.environ.get("PAPER_HOST") or ("0.0.0.0" if in_codespaces else "127.0.0.1")
     loopback = host in ("127.0.0.1", "localhost", "::1")
-    state = {"envExists": os.path.isfile(_ENV_PATH), "envPath": _ENV_PATH, "defaultModel": _DEFAULT_MODEL}
+    state = {
+        "envExists": os.path.isfile(_ENV_PATH),
+        "envPath": _ENV_PATH,
+        "order": PROVIDER_ORDER,
+        "current": _resolve_provider(),
+        "providers": {
+            n: {k: s[k] for k in ("label", "needs_key", "key_optional", "key_prefix", "key_url",
+                                  "default_model", "base_url", "url_editable", "local", "note")}
+            for n, s in PROVIDERS.items()
+        },
+    }
     served = {"page": False}          # did a browser ever load the setup page?
     page = (_SETUP_PAGE
             .replace("__SETUP_TOKEN__", token)
@@ -692,37 +1145,63 @@ def _run_setup_wizard(reason):
             if body is None:
                 return self._json(400, {"error": "Bad request body."})
             try:
+                if path not in ("/api/check", "/api/save"):
+                    return self._json(404, {"error": "Unknown endpoint."})
+
+                provider = str(body.get("provider") or "").strip().lower()
+                if provider not in PROVIDERS:
+                    return self._json(400, {"error": "Pick a provider first."})
+                spec = PROVIDERS[provider]
+                label = spec["label"]
+
                 key = _clean_key(body.get("key"))
-                if path in ("/api/check", "/api/save") and not _KEY_RE.match(key):
-                    return self._json(400, {"error": "That doesn't look like a Groq key. "
-                                                     "It starts with gsk_ and has no spaces."})
+                if spec["needs_key"] or key:
+                    if not key:
+                        return self._json(400, {"error": f"Paste your {label} API key."})
+                    if not _KEY_RE.match(key):
+                        return self._json(400, {"error": f"That doesn't look like a {label} key. "
+                                                         "It has no spaces or quotes."})
+                base_url, url_err = _effective_base_url(spec, body.get("base_url"))
+                if url_err:
+                    return self._json(400, {"error": url_err})
 
                 if path == "/api/check":
-                    models, err, can_skip = _check_groq_key(key)
+                    models, err, can_skip = _check_provider(provider, key, base_url)
                     if err:
                         return self._json(400, {"error": err, "can_skip": can_skip})
-                    return self._json(200, {"ok": True, "models": models, "default": _DEFAULT_MODEL})
+                    return self._json(200, {"ok": True, "models": models, "default": spec["default_model"]})
 
-                if path == "/api/save":
-                    model = body.get("model") or _DEFAULT_MODEL
-                    if not isinstance(model, str) or not _MODEL_RE.match(model.strip()):
-                        return self._json(400, {"error": "That model name isn't valid."})
-                    model = model.strip()
-                    try:
-                        _write_env({"GROQ_API_KEY": key, "PAPER_MODEL": model})
-                    except OSError as e:
-                        return self._json(500, {"error": f"Couldn't write {_ENV_PATH}: {e}. "
-                                                         "Check that the folder is writable."})
-                    os.environ["GROQ_API_KEY"] = key
-                    os.environ["PAPER_MODEL"] = model
-                    print(f"   ✅ Saved your settings to {_ENV_PATH}")
-                    _protect_env_in_git()
-                    self._json(200, {"ok": True})
-                    done.set()
-                    return
+                # /api/save
+                model = body.get("model") or spec["default_model"]
+                if not isinstance(model, str) or not _MODEL_RE.match(model.strip()):
+                    return self._json(400, {"error": "That model name isn't valid."})
+                model = model.strip()
+
+                updates = {"PAPER_PROVIDER": provider, "PAPER_MODEL": model}
+                remove = set()
+                if key:
+                    updates[spec["key_env"]] = key
+                elif spec["key_optional"]:
+                    remove.add(spec["key_env"])
+                if spec["url_editable"] and base_url != spec["base_url"]:
+                    updates["PAPER_BASE_URL"] = base_url
+                else:
+                    remove.add("PAPER_BASE_URL")
+                try:
+                    _write_env(updates, remove)
+                except OSError as e:
+                    return self._json(500, {"error": f"Couldn't write {_ENV_PATH}: {e}. "
+                                                     "Check that the folder is writable."})
+                os.environ.update(updates)
+                for r in remove:
+                    os.environ.pop(r, None)
+                print(f"   ✅ Saved your settings to {_ENV_PATH}  ({label}, model {model})")
+                _protect_env_in_git()
+                self._json(200, {"ok": True})
+                done.set()
+                return
             except Exception as e:
                 return self._json(500, {"error": f"{type(e).__name__}: {e}"})
-            return self._json(404, {"error": "Unknown endpoint."})
 
     class SetupServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -746,7 +1225,7 @@ def _run_setup_wizard(reason):
 
     url = f"http://localhost:{port}"
     print("=" * 55)
-    print("🔑 Paper needs a Groq API key before it can start")
+    print("🔑 Paper needs an AI provider before it can start")
     print(f"   ({reason})")
     print(f"   Finish the setup in your browser: {url}")
     if in_codespaces:
@@ -786,9 +1265,7 @@ def ensure_environment():
         reason = "you started Paper with --setup"
     else:
         load_dotenv(_ENV_PATH)
-        if _key_is_missing(os.environ.get("GROQ_API_KEY")):
-            reason = (".env has no GROQ_API_KEY" if os.path.isfile(_ENV_PATH)
-                      else "no .env file found yet")
+        reason = _config_problem()
     if reason:
         _run_setup_wizard(reason)
 
@@ -796,22 +1273,23 @@ def ensure_environment():
 ensure_environment()
 
 from dotenv import load_dotenv
-from groq import Groq
 
-# Load API key from the .env file beside this script
+# Load settings from the .env file beside this script
 load_dotenv(_ENV_PATH)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY. Run: python paper.py --setup")
+PROVIDER = _resolve_provider()
+if PROVIDER is None or _config_problem():
+    raise RuntimeError(f"Paper isn't set up ({_config_problem()}). Run: python paper.py --setup")
+PROVIDER_LABEL = PROVIDERS[PROVIDER]["label"]
+BASE_URL = _base_url_for(PROVIDER)
 
-client = Groq(api_key=GROQ_API_KEY)
+client = LLMClient(PROVIDER, _api_key_for(PROVIDER), BASE_URL)
 
 # ------------------------------------------------------------------
 # Settings
 # ------------------------------------------------------------------
-# Change the model by setting PAPER_MODEL in .env (or edit the default here).
-MODEL_NAME = os.environ.get("PAPER_MODEL", "openai/gpt-oss-20b").strip()
+# Change provider or model by editing .env (PAPER_PROVIDER, PAPER_MODEL) or run: python paper.py --setup
+MODEL_NAME = _model_for(PROVIDER)
 AI_NAME = "Paper by Silicon"
 CUSTOM_IDENTITY = "Paper By Silicon (Custom)"
 
@@ -1289,13 +1767,13 @@ def run_terminal(op, workspace):
     """
     Run any command line through the system shell (pipes, &&, redirects all work),
     inside the chat folder. stdout/stderr/exit code are captured and returned.
-    Only GROQ_API_KEY is removed from the environment.
+    Every AI-provider API key is removed from the environment.
     """
     command = op.get("command")
     if not isinstance(command, str) or not command.strip():
         return {"success": False, "error": "No command given"}
 
-    env = {k: v for k, v in os.environ.items() if k != "GROQ_API_KEY"}
+    env = {k: v for k, v in os.environ.items() if k not in _SECRET_ENV_NAMES}
     env.setdefault("PYTHONIOENCODING", "utf-8")
 
     try:
@@ -1344,7 +1822,7 @@ IDENTITY_PROMPT_RULE = (
 
 HOW_IT_WORKS = (
     "HOW PAPER ACTUALLY WORKS (true facts about yourself, use them when asked to explain yourself):\n"
-    f"- Paper is a Python program (paper.py) wrapped around a language model ({MODEL_NAME}). "
+    f"- Paper is a Python program (paper.py) wrapped around a language model ({MODEL_NAME} via {PROVIDER_LABEL}). "
     "The model is the 'brain'; the Python script is the 'hands'. The model cannot touch files or run commands itself.\n"
     "- Every chat gets its own folder (chats/<name>/) holding chat_history.json, chat_memory.json and a files/ folder.\n"
     "- For each message you send: (1) Paper scans the chat folder, (2) it sends the model your request, the file list, "
@@ -2741,6 +3219,8 @@ def state_payload():
         "version": "1.0",
         "ai_name": AI_NAME,
         "model": MODEL_NAME,
+        "provider": PROVIDER,
+        "provider_label": PROVIDER_LABEL,
         "identity": IDENTITY_VALUE,
         "root": ROOT_WORKSPACE,
         "chats_dir": CHATS_DIR,
@@ -2960,7 +3440,7 @@ def serve():
 
     print(f"\n📂 Chats folder   : {CHATS_DIR}")
     print(f"💾 Shared memory  : {SHARED_MEMORY_FILE}")
-    print(f"🤖 Model          : {MODEL_NAME}")
+    print(f"🤖 Model          : {MODEL_NAME}  ({PROVIDER_LABEL})")
     print(f"🪪 Identity       : {IDENTITY_VALUE}")
     print(f"🔒 File access    : chat folder only; outside paths need per-path approval")
     print(f"🖥️  Terminal       : ANY command ({'approval required' if TERMINAL_REQUIRE_APPROVAL else 'NO approval'}, "
