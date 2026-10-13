@@ -1633,6 +1633,7 @@ details.activity summary:hover { background: rgba(14, 14, 14, 0.04); }
             try { s = await api('/api/state'); } catch (e) { toast(e.message, true); return; }
             app.info = s;
             const rows = [
+                ['Provider', s.provider_label || s.provider],
                 ['Model', s.model],
                 ['Identity', s.identity],
                 ['Root workspace', s.root],
